@@ -1,0 +1,22 @@
+{
+  "id": "profile",
+  "name": "Marcelo Santos",
+  "title": "Minha biografiawerwer",
+  "bio": "Sou uma pessoa honesta, amigavél, bonita, e bem formada",
+  "photo_url": "/uploads/1759795586837-369701732.png",
+  "email": "kayrtonsmnbvc123@gmail.com",
+  "linkedin": "https://br.linkedin.com/",
+  "phone": "77998163524",
+  "languages": [
+    "Portugues",
+    "Espanhol",
+    "Italiano"
+  ],
+  "skills": [
+    "Figma",
+    "melhore"
+  ],
+  "education": "Analista e desenvolvedor de sistemas, cientista da computação",
+  "created_at": "2025-10-06T23:48:36.570Z",
+  "updated_at": "2025-10-08T22:52:39.279Z"
+}
