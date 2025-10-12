@@ -1,31 +1,22 @@
 // index.js
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import bcrypt from 'bcryptjs';
+import morgan from 'morgan';
+import pg from 'pg';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { randomUUID } from 'crypto';
 
-// -------------------- paths básicos --------------------
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const dataDir = path.join(__dirname, 'data');
-const uploadsDir = path.join(__dirname, 'uploads');
-
-const dataFiles = {
-  users: path.join(dataDir, 'users.txt'),
-  profile: path.join(dataDir, 'profile.txt'),
-  projects: path.join(dataDir, 'projects.txt'),
-};
-
-// -------------------- admin padrão --------------------
+// -------------------- CONFIG/CONSTS --------------------
 const ADMIN_EMAIL = 'caroline@gmail.com';
-// hash de "123456" (exemplo). Troque quando quiser.
+// hash de "123456" (troque quando quiser)
 const ADMIN_PASSWORD_HASH = '$2a$10$SwOJj1.JWCL7wUBTX4BdYePR4zLkOb/rLpLVT1fDCNRoWkkrY7omW';
 
-// -------------------- perfil padrão --------------------
+// perfil padrão (mantém o contrato da API)
 const defaultProfile = {
   id: 'profile',
   name: '',
@@ -42,76 +33,78 @@ const defaultProfile = {
   updated_at: '',
 };
 
-// -------------------- helpers de arquivo --------------------
-async function ensureFile(filePath, defaultValue) {
-  try {
-    await fs.access(filePath);
-  } catch {
-    await fs.writeFile(filePath, JSON.stringify(defaultValue, null, 2), 'utf-8');
-  }
-}
+// -------------------- PATHS BÁSICOS (só p/ uploads estáticos) --------------------
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const uploadsDir = path.join(__dirname, 'uploads');
+await fs.mkdir(uploadsDir, { recursive: true });
 
-async function ensureDataFiles() {
-  await fs.mkdir(dataDir, { recursive: true });
-  await fs.mkdir(uploadsDir, { recursive: true });
-  await ensureFile(dataFiles.users, []);
-  await ensureFile(dataFiles.projects, []);
-  await ensureFile(dataFiles.profile, defaultProfile);
-}
+// -------------------- DB (POSTGRES) --------------------
+const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }, // Render/Neon exigem SSL
+});
 
-async function readJson(filePath, defaultValue) {
-  try {
-    const content = await fs.readFile(filePath, 'utf-8');
-    if (!content) return defaultValue;
-    return JSON.parse(content);
-  } catch (error) {
-    if (error.code === 'ENOENT') {
-      await fs.writeFile(filePath, JSON.stringify(defaultValue, null, 2), 'utf-8');
-      return defaultValue;
-    }
-    throw error;
-  }
-}
+async function initDb() {
+  // usamos tipos "text" p/ id para evitar dependência de extensões de UUID
+  await pool.query(`
+    create table if not exists users (
+      id text primary key,
+      email text unique not null,
+      username text,
+      password_hash text not null,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
 
-async function writeJson(filePath, data) {
-  await fs.writeFile(filePath, JSON.stringify(data, null, 2), 'utf-8');
+    create table if not exists profile (
+      id text primary key,
+      name text,
+      title text,
+      bio text,
+      photo_url text,
+      email text,
+      linkedin text,
+      phone text,
+      languages jsonb default '[]'::jsonb,
+      skills jsonb default '[]'::jsonb,
+      education text,
+      created_at timestamptz,
+      updated_at timestamptz
+    );
+
+    create table if not exists projects (
+      id text primary key,
+      title text not null,
+      description text not null,
+      category text not null,
+      date text,
+      image_url text,
+      external_link text,
+      order_position int default 0,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+  `);
 }
 
 async function ensureAdminUser() {
-  const users = await readJson(dataFiles.users, []);
-  const now = new Date().toISOString();
-  const adminLower = ADMIN_EMAIL.toLowerCase();
-
-  const existingAdmin = users.find((user) => {
-    const identifier = String(user.email ?? user.username ?? '').toLowerCase();
-    return identifier === adminLower;
-  });
-
-  const adminUser = {
-    id: existingAdmin?.id ?? 'admin',
-    username: ADMIN_EMAIL,
-    email: ADMIN_EMAIL,
-    passwordHash: ADMIN_PASSWORD_HASH,
-    created_at: existingAdmin?.created_at ?? now,
-    updated_at: existingAdmin?.updated_at ?? now,
-  };
-
-  let finalUsers;
-  if (existingAdmin) {
-    // mantém apenas um admin (e remove duplicados antigos)
-    finalUsers = [adminUser];
-  } else {
-    finalUsers = [adminUser, ...users.filter(u => String(u.email ?? u.username ?? '').toLowerCase() !== adminLower)];
+  const { rows } = await pool.query(
+    'select 1 from users where lower(email)=lower($1) limit 1',
+    [ADMIN_EMAIL]
+  );
+  if (!rows.length) {
+    await pool.query(
+      'insert into users (id,email,username,password_hash) values ($1,$2,$3,$4)',
+      [randomUUID(), ADMIN_EMAIL, ADMIN_EMAIL, ADMIN_PASSWORD_HASH]
+    );
   }
-
-  await writeJson(dataFiles.users, finalUsers);
 }
 
-// cria estrutura inicial antes de subir o servidor
-await ensureDataFiles();
+await initDb();
 await ensureAdminUser();
 
-// -------------------- upload (multer) --------------------
+// -------------------- UPLOAD (atenção: disco da Render Free é efêmero) --------------------
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, uploadsDir),
   filename: (_req, file, cb) => {
@@ -120,16 +113,11 @@ const storage = multer.diskStorage({
     cb(null, `${unique}${ext}`);
   },
 });
+const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB
 
-const upload = multer({
-  storage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
-});
-
-// -------------------- app / middlewares --------------------
+// -------------------- APP / MIDDLEWARES --------------------
 const app = express();
 
-// CORS com whitelist por env (ex.: "https://seu-front.vercel.app,https://www.seudominio.com")
 const ALLOWED = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
@@ -137,130 +125,168 @@ const ALLOWED = (process.env.ALLOWED_ORIGINS || '')
 
 app.use(cors({
   origin: (origin, cb) => {
-    // permite curl/postman (sem origin) e whitelista as origins de navegador
-    if (!origin) return cb(null, true);
+    if (!origin) return cb(null, true); // curl/postman
     if (ALLOWED.length === 0 || ALLOWED.includes(origin)) return cb(null, true);
     return cb(new Error('CORS bloqueado: ' + origin));
   },
   credentials: true,
 }));
 
+app.use(morgan('combined'));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use((_, res, next) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  next();
+});
 app.use('/uploads', express.static(uploadsDir));
 
-// -------------------- rotas --------------------
-app.get('/health', (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+// -------------------- ROTAS --------------------
+app.get('/health', (_req, res) =>
+  res.json({ ok: true, time: new Date().toISOString() })
+);
 
-// Auth simples (compara com admin padrão)
+// AUTH
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body ?? {};
     if (!email || !password) {
       return res.status(400).json({ success: false, message: 'E-mail e senha são obrigatórios.' });
     }
+    const q = await pool.query(
+      'select * from users where lower(email)=lower($1) limit 1',
+      [String(email).toLowerCase()]
+    );
+    const user = q.rows[0];
+    if (!user) return res.status(401).json({ success: false, message: 'Credenciais inválidas.' });
 
-    const users = await readJson(dataFiles.users, []);
-    const normalizedEmail = String(email).trim().toLowerCase();
-    const user = users.find((item) => String(item.email ?? item.username).toLowerCase() === normalizedEmail);
-
-    if (!user) {
-      return res.status(401).json({ success: false, message: 'Credenciais inválidas.' });
-    }
-
-    const valid = await bcrypt.compare(String(password), user.passwordHash);
-    if (!valid) {
-      return res.status(401).json({ success: false, message: 'Credenciais inválidas.' });
-    }
+    const ok = await bcrypt.compare(String(password), user.password_hash);
+    if (!ok) return res.status(401).json({ success: false, message: 'Credenciais inválidas.' });
 
     return res.json({ success: true });
   } catch (error) {
     return res.status(500).json({
       success: false,
-      message: error instanceof Error ? error.message : 'Erro ao realizar login.',
+      message: error?.message || 'Erro ao realizar login.',
     });
   }
 });
 
-// Profile - GET
+// PROFILE - GET
 app.get('/api/profile', async (_req, res) => {
   try {
-    const profile = await readJson(dataFiles.profile, defaultProfile);
-    return res.json(profile);
+    const { rows } = await pool.query('select * from profile where id=$1', ['profile']);
+    if (!rows.length) return res.json(defaultProfile);
+    const p = rows[0];
+    return res.json({
+      id: 'profile',
+      name: p.name || '',
+      title: p.title || '',
+      bio: p.bio || '',
+      photo_url: p.photo_url || '',
+      email: p.email || '',
+      linkedin: p.linkedin || '',
+      phone: p.phone || '',
+      languages: p.languages || [],
+      skills: p.skills || [],
+      education: p.education || '',
+      created_at: p.created_at || '',
+      updated_at: p.updated_at || '',
+    });
   } catch (error) {
     return res.status(500).json({
       success: false,
-      message: error instanceof Error ? error.message : 'Erro ao carregar perfil.',
+      message: error?.message || 'Erro ao carregar perfil.',
     });
   }
 });
 
-// Profile - PUT
+// PROFILE - PUT
 app.put('/api/profile', async (req, res) => {
   try {
-    const profile = await readJson(dataFiles.profile, defaultProfile);
     const now = new Date().toISOString();
+    const b = req.body ?? {};
 
-    const languages = Array.isArray(req.body?.languages)
-      ? req.body.languages.map(String)
-      : typeof req.body?.languages === 'string'
-        ? String(req.body.languages).split(',').map(s => s.trim()).filter(Boolean)
-        : profile.languages ?? [];
+    const languages = Array.isArray(b.languages)
+      ? b.languages.map(String)
+      : typeof b.languages === 'string'
+        ? String(b.languages).split(',').map(s => s.trim()).filter(Boolean)
+        : [];
 
-    const skills = Array.isArray(req.body?.skills)
-      ? req.body.skills.map(String)
-      : typeof req.body?.skills === 'string'
-        ? String(req.body.skills).split(',').map(s => s.trim()).filter(Boolean)
-        : profile.skills ?? [];
+    const skills = Array.isArray(b.skills)
+      ? b.skills.map(String)
+      : typeof b.skills === 'string'
+        ? String(b.skills).split(',').map(s => s.trim()).filter(Boolean)
+        : [];
 
-    const updatedProfile = {
-      ...defaultProfile,
-      ...profile,
+    const exists = await pool.query('select 1 from profile where id=$1', ['profile']);
+    if (exists.rowCount) {
+      await pool.query(
+        `update profile set
+           name=$1, title=$2, bio=$3, photo_url=$4, email=$5, linkedin=$6, phone=$7,
+           languages=$8::jsonb, skills=$9::jsonb, education=$10, updated_at=$11
+         where id='profile'`,
+        [
+          String(b.name ?? ''), String(b.title ?? ''), String(b.bio ?? ''),
+          String(b.photo_url ?? ''), String(b.email ?? ''), String(b.linkedin ?? ''),
+          String(b.phone ?? ''), JSON.stringify(languages), JSON.stringify(skills),
+          String(b.education ?? ''), now
+        ]
+      );
+    } else {
+      await pool.query(
+        `insert into profile
+          (id,name,title,bio,photo_url,email,linkedin,phone,languages,skills,education,created_at,updated_at)
+         values
+          ('profile',$1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$11,$11)`,
+        [
+          String(b.name ?? ''), String(b.title ?? ''), String(b.bio ?? ''),
+          String(b.photo_url ?? ''), String(b.email ?? ''), String(b.linkedin ?? ''),
+          String(b.phone ?? ''), JSON.stringify(languages), JSON.stringify(skills),
+          String(b.education ?? ''), now
+        ]
+      );
+    }
+
+    return res.json({
       id: 'profile',
-      languages,
-      skills,
-      name: req.body?.name !== undefined ? String(req.body.name) : profile.name,
-      title: req.body?.title !== undefined ? String(req.body.title) : profile.title,
-      bio: req.body?.bio !== undefined ? String(req.body.bio) : profile.bio,
-      photo_url: req.body?.photo_url !== undefined ? String(req.body.photo_url) : profile.photo_url,
-      email: req.body?.email !== undefined ? String(req.body.email) : profile.email,
-      linkedin: req.body?.linkedin !== undefined ? String(req.body.linkedin) : profile.linkedin,
-      phone: req.body?.phone !== undefined ? String(req.body.phone) : profile.phone,
-      education: req.body?.education !== undefined ? String(req.body.education) : profile.education,
-      created_at: profile.created_at || now,
+      name: String(b.name ?? ''),
+      title: String(b.title ?? ''),
+      bio: String(b.bio ?? ''),
+      photo_url: String(b.photo_url ?? ''),
+      email: String(b.email ?? ''),
+      linkedin: String(b.linkedin ?? ''),
+      phone: String(b.phone ?? ''),
+      languages, skills,
+      education: String(b.education ?? ''),
+      created_at: exists.rowCount ? undefined : now,
       updated_at: now,
-    };
-
-    await writeJson(dataFiles.profile, updatedProfile);
-    return res.json(updatedProfile);
+    });
   } catch (error) {
     return res.status(500).json({
       success: false,
-      message: error instanceof Error ? error.message : 'Erro ao atualizar perfil.',
+      message: error?.message || 'Erro ao atualizar perfil.',
     });
   }
 });
 
-// Projects - GET
+// PROJECTS - GET
 app.get('/api/projects', async (_req, res) => {
   try {
-    const projects = await readJson(dataFiles.projects, []);
-    const sorted = [...projects].sort((a, b) => {
-      if ((a.order_position ?? 0) !== (b.order_position ?? 0)) {
-        return (a.order_position ?? 0) - (b.order_position ?? 0);
-      }
-      return new Date(b.date).getTime() - new Date(a.date).getTime();
-    });
-    return res.json(sorted);
+    const { rows } = await pool.query(`
+      select * from projects
+      order by coalesce(order_position,0) asc, updated_at desc
+    `);
+    return res.json(rows);
   } catch (error) {
     return res.status(500).json({
       success: false,
-      message: error instanceof Error ? error.message : 'Erro ao carregar projetos.',
+      message: error?.message || 'Erro ao carregar projetos.',
     });
   }
 });
 
-// Projects - POST
+// PROJECTS - POST
 app.post('/api/projects', async (req, res) => {
   try {
     const { title, description, category, date, image_url, external_link, order_position } = req.body ?? {};
@@ -268,92 +294,92 @@ app.post('/api/projects', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Título, descrição e categoria são obrigatórios.' });
     }
 
-    const projects = await readJson(dataFiles.projects, []);
+    const id = randomUUID();
     const now = new Date().toISOString();
     const position = Number(order_position);
 
-    const newProject = {
-      id: randomUUID(),
-      title: String(title),
-      description: String(description),
-      category: String(category),
-      date: date ? String(date) : now,
-      image_url: image_url ? String(image_url) : '',
-      external_link: external_link !== undefined ? (external_link ? String(external_link) : null) : null,
-      order_position: Number.isFinite(position) ? position : 0,
-      created_at: now,
-      updated_at: now,
-    };
+    const q = await pool.query(
+      `insert into projects
+        (id,title,description,category,date,image_url,external_link,order_position,created_at,updated_at)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9)
+       returning *`,
+      [
+        id, String(title), String(description), String(category),
+        date ? String(date) : now,
+        image_url ? String(image_url) : '',
+        external_link ? String(external_link) : null,
+        Number.isFinite(position) ? position : 0,
+        now
+      ]
+    );
 
-    projects.push(newProject);
-    await writeJson(dataFiles.projects, projects);
-    return res.status(201).json(newProject);
+    return res.status(201).json(q.rows[0]);
   } catch (error) {
     return res.status(500).json({
       success: false,
-      message: error instanceof Error ? error.message : 'Erro ao adicionar projeto.',
+      message: error?.message || 'Erro ao adicionar projeto.',
     });
   }
 });
 
-// Projects - PUT
+// PROJECTS - PUT
 app.put('/api/projects/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const projects = await readJson(dataFiles.projects, []);
-    const index = projects.findIndex((p) => p.id === id);
-    if (index === -1) {
+    const cur = await pool.query('select * from projects where id=$1', [id]);
+    if (!cur.rowCount) {
       return res.status(404).json({ success: false, message: 'Projeto não encontrado.' });
     }
-
-    const current = projects[index];
+    const c = cur.rows[0];
     const now = new Date().toISOString();
     const position = Number(req.body?.order_position);
 
-    projects[index] = {
-      ...current,
-      title: req.body?.title !== undefined ? String(req.body.title) : current.title,
-      description: req.body?.description !== undefined ? String(req.body.description) : current.description,
-      category: req.body?.category !== undefined ? String(req.body.category) : current.category,
-      date: req.body?.date !== undefined ? String(req.body.date) : current.date,
-      image_url: req.body?.image_url !== undefined ? String(req.body.image_url) : current.image_url,
-      external_link: req.body?.external_link !== undefined
-        ? (req.body.external_link ? String(req.body.external_link) : null)
-        : current.external_link,
-      order_position: Number.isFinite(position) ? position : (current.order_position ?? 0),
-      updated_at: now,
+    const updated = {
+      title: req.body?.title ?? c.title,
+      description: req.body?.description ?? c.description,
+      category: req.body?.category ?? c.category,
+      date: req.body?.date ?? c.date,
+      image_url: req.body?.image_url ?? c.image_url,
+      external_link: req.body?.external_link ?? c.external_link,
+      order_position: Number.isFinite(position) ? position : c.order_position,
     };
 
-    await writeJson(dataFiles.projects, projects);
-    return res.json(projects[index]);
+    const q = await pool.query(
+      `update projects set
+         title=$2, description=$3, category=$4, date=$5, image_url=$6,
+         external_link=$7, order_position=$8, updated_at=$9
+       where id=$1 returning *`,
+      [ id, updated.title, updated.description, updated.category, updated.date,
+        updated.image_url, updated.external_link, updated.order_position, now ]
+    );
+
+    return res.json(q.rows[0]);
   } catch (error) {
     return res.status(500).json({
       success: false,
-      message: error instanceof Error ? error.message : 'Erro ao atualizar projeto.',
+      message: error?.message || 'Erro ao atualizar projeto.',
     });
   }
 });
 
-// Projects - DELETE
+// PROJECTS - DELETE
 app.delete('/api/projects/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const projects = await readJson(dataFiles.projects, []);
-    const filtered = projects.filter((p) => p.id !== id);
-    if (filtered.length === projects.length) {
+    const r = await pool.query('delete from projects where id=$1', [id]);
+    if (!r.rowCount) {
       return res.status(404).json({ success: false, message: 'Projeto não encontrado.' });
     }
-    await writeJson(dataFiles.projects, filtered);
     return res.json({ success: true });
   } catch (error) {
     return res.status(500).json({
       success: false,
-      message: error instanceof Error ? error.message : 'Erro ao remover projeto.',
+      message: error?.message || 'Erro ao remover projeto.',
     });
   }
 });
 
-// Uploads
+// UPLOADS (atenção: em Render Free, arquivos somem se a instância hibernar/redeploy)
 app.post('/api/uploads', upload.single('file'), (req, res) => {
   if (!req.file) {
     return res.status(400).json({ success: false, message: 'Nenhum arquivo enviado.' });
@@ -362,15 +388,16 @@ app.post('/api/uploads', upload.single('file'), (req, res) => {
   return res.status(201).json({ success: true, path: relativePath });
 });
 
-// -------------------- erro genérico --------------------
+// -------------------- ERRO GENÉRICO --------------------
 app.use((err, _req, res, _next) => {
+  console.error('Erro global:', err);
   if (err?.message?.startsWith?.('CORS bloqueado')) {
     return res.status(403).json({ success: false, message: err.message });
   }
   return res.status(500).json({ success: false, message: 'Erro interno.' });
 });
 
-// -------------------- start --------------------
+// -------------------- START --------------------
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`Servidor em execução na porta ${PORT}`);
