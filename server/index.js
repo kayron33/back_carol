@@ -6,9 +6,6 @@ import multer from 'multer';
 import bcrypt from 'bcryptjs';
 import morgan from 'morgan';
 import pg from 'pg';
-import { promises as fs } from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import { randomUUID } from 'crypto';
 
 // -------------------- CONFIG/CONSTS --------------------
@@ -33,12 +30,6 @@ const defaultProfile = {
   updated_at: '',
 };
 
-// -------------------- PATHS BÁSICOS (só p/ uploads estáticos) --------------------
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const uploadsDir = path.join(__dirname, 'uploads');
-await fs.mkdir(uploadsDir, { recursive: true });
-
 // -------------------- DB (POSTGRES) --------------------
 const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
@@ -46,7 +37,6 @@ const pool = new pg.Pool({
 });
 
 async function initDb() {
-  // usamos tipos "text" p/ id para evitar dependência de extensões de UUID
   await pool.query(`
     create table if not exists users (
       id text primary key,
@@ -85,6 +75,15 @@ async function initDb() {
       created_at timestamptz not null default now(),
       updated_at timestamptz not null default now()
     );
+
+    -- armazenamento de arquivos (imagens) no próprio Postgres
+    create table if not exists uploads (
+      id text primary key,
+      filename text not null,
+      mime text not null,
+      data bytea not null,
+      created_at timestamptz not null default now()
+    );
   `);
 }
 
@@ -104,16 +103,12 @@ async function ensureAdminUser() {
 await initDb();
 await ensureAdminUser();
 
-// -------------------- UPLOAD (atenção: disco da Render Free é efêmero) --------------------
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, uploadsDir),
-  filename: (_req, file, cb) => {
-    const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
-    const ext = path.extname(file.originalname) || '.bin';
-    cb(null, `${unique}${ext}`);
-  },
+// -------------------- UPLOAD (agora em memória, salvando no DB) --------------------
+const storage = multer.memoryStorage();
+const upload = multer({
+  storage,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
 });
-const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB
 
 // -------------------- APP / MIDDLEWARES --------------------
 const app = express();
@@ -139,7 +134,6 @@ app.use((_, res, next) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
   next();
 });
-app.use('/uploads', express.static(uploadsDir));
 
 // -------------------- ROTAS --------------------
 app.get('/health', (_req, res) =>
@@ -379,13 +373,49 @@ app.delete('/api/projects/:id', async (req, res) => {
   }
 });
 
-// UPLOADS (atenção: em Render Free, arquivos somem se a instância hibernar/redeploy)
-app.post('/api/uploads', upload.single('file'), (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ success: false, message: 'Nenhum arquivo enviado.' });
+// UPLOADS → salvando no Postgres e servindo por /files/:id
+app.post('/api/uploads', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: 'Nenhum arquivo enviado.' });
+    }
+    // (Opcional) restringir a imagens:
+    // if (!/^image\//.test(req.file.mimetype)) return res.status(400).json({ success:false, message:'Apenas imagens.' });
+
+    const id = randomUUID();
+    const filename = req.file.originalname || `${id}.bin`;
+    const mime = req.file.mimetype || 'application/octet-stream';
+
+    await pool.query(
+      'insert into uploads (id, filename, mime, data) values ($1,$2,$3,$4)',
+      [id, filename, mime, req.file.buffer]
+    );
+
+    // IMPORTANTE: salve este `path` na sua tabela (profile.photo_url / projects.image_url)
+    const path = `/files/${id}`;
+    return res.status(201).json({ success: true, path, id, filename, mime });
+  } catch (e) {
+    console.error('Erro no upload:', e);
+    return res.status(500).json({ success: false, message: 'Falha no upload' });
   }
-  const relativePath = `/uploads/${req.file.filename}`;
-  return res.status(201).json({ success: true, path: relativePath });
+});
+
+// Servindo os arquivos armazenados no DB
+app.get('/files/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const q = await pool.query('select filename, mime, data from uploads where id=$1', [id]);
+    if (!q.rowCount) return res.status(404).send('Arquivo não encontrado');
+    const { filename, mime, data } = q.rows[0];
+
+    res.setHeader('Content-Type', mime || 'application/octet-stream');
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(filename)}"`);
+    return res.status(200).end(data);
+  } catch (e) {
+    console.error('Erro ao servir arquivo:', e);
+    return res.status(500).send('Erro ao servir arquivo');
+  }
 });
 
 // -------------------- ERRO GENÉRICO --------------------
